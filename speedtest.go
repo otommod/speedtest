@@ -2,59 +2,56 @@ package speedtest
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dchest/uniuri"
 	"github.com/zpeters/speedtest/internal/coords"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
-	SpeedtestNetConfigURL      = "http://speedtest.net/speedtest-config.php?x=" + uniuri.New()
-	SpeedtestNetServersListURL = "http://speedtest.net/speedtest-servers-static.php?x=" + uniuri.New()
+	SpeedtestNetConfigURL  = "http://speedtest.net/speedtest-config.php?x=" + uniuri.New()
+	SpeedtestNetServersURL = "http://speedtest.net/speedtest-servers.php?x=" + uniuri.New()
 )
 
-type Server struct {
-	XMLName  xml.Name `xml:"server"`
-	URL      string   `xml:"url,attr"`
-	Lat      float64  `xml:"lat,attr"`
-	Lon      float64  `xml:"lon,attr"`
-	Name     string   `xml:"name,attr"`
-	Country  string   `xml:"country,attr"`
-	CC       string   `xml:"cc,attr"`
-	Sponsor  string   `xml:"sponsor,attr"`
-	ID       string   `xml:"id,attr"`
-	Distance float64  `xml:"-"`
-	Latency  float64  `xml:"-"`
+type Client struct {
+	UserAgent string
+
+	httpClient *http.Client
 }
 
-// Config struct holds our config (users current ip, lat, lon and isp)
-type Config struct {
-	IP  string  `xml:"ip,attr"`
-	Lat float64 `xml:"lat,attr"`
-	Lon float64 `xml:"lon,attr"`
+func NewClient(httpClient *http.Client) Client {
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+
+	return Client{
+		httpClient: httpClient,
+	}
 }
 
-type Conf struct {
-	HTTPClient *http.Client
-	UserAgent  string
-}
-
-func getResource(url string, c Conf, xmlData interface{}) error {
+func (c Client) getResource(url string, xmlData interface{}) error {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Accept", "application/xml")
 	req.Header.Set("User-Agent", c.UserAgent)
 
-	resp, err := c.HTTPClient.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -63,27 +60,65 @@ func getResource(url string, c Conf, xmlData interface{}) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("non-OK status code: %s", resp.Status)
 	}
-
 	return xml.NewDecoder(resp.Body).Decode(xmlData)
 }
 
-func GetClientConfig(configURL string, c Conf) (Config, error) {
-	var cx struct {
-		XMLName xml.Name `xml:"settings"`
-		Client  Config   `xml:"client"`
-	}
-
-	err := getResource(configURL, c, &cx)
-	return cx.Client, err
+type Config struct {
+	Client ConfigClient `xml:"client"`
+	Server ConfigServer `xml:"server-config"`
 }
 
-func GetServers(serverListURL string, c Conf) ([]Server, error) {
+type ConfigClient struct {
+	IP        string  `xml:"ip,attr"`
+	ISP       string  `xml:"isp,attr"`
+	Country   string  `xml:"country,attr"`
+	Latitude  float64 `xml:"lat,attr"`
+	Longitude float64 `xml:"lon,attr"`
+}
+
+type ConfigServer struct {
+	IgnoreIDs   string `xml:"ignoreids,attr"`
+	ThreadCount int    `xml:"threadcount,attr"`
+}
+
+func (c Client) GetSpeedtestConfig(configURL string) (Config, error) {
+	var cx struct {
+		XMLName xml.Name `xml:"settings"`
+		Config
+	}
+
+	err := c.getResource(configURL, &cx)
+	return cx.Config, err
+}
+
+type UnmarshableURL url.URL
+
+func (u *UnmarshableURL) UnmarshalText(text []byte) error {
+	return (*url.URL)(u).UnmarshalBinary(text)
+}
+
+type Server struct {
+	URL      *UnmarshableURL `xml:"url,attr"`
+	URL2     *UnmarshableURL `xml:"url2,attr"`
+	Host     string          `xml:"host,attr"`
+	Lat      float64         `xml:"lat,attr"`
+	Lon      float64         `xml:"lon,attr"`
+	Name     string          `xml:"name,attr"`
+	Country  string          `xml:"country,attr"`
+	CC       string          `xml:"cc,attr"`
+	Sponsor  string          `xml:"sponsor,attr"`
+	ID       string          `xml:"id,attr"`
+	Distance float64         `xml:"-"`
+	Latency  float64         `xml:"-"`
+}
+
+func (c Client) GetServers(serverListURL string) ([]Server, error) {
 	var sx struct {
 		XMLName xml.Name `xml:"settings"`
 		Servers []Server `xml:"servers>server"`
 	}
 
-	err := getResource(serverListURL, c, &sx)
+	err := c.getResource(serverListURL, &sx)
 	return sx.Servers, err
 }
 
@@ -96,63 +131,147 @@ func ComputeServersDistanceTo(servers []Server, lat, lon float64) error {
 	return nil
 }
 
+type meteredConn struct {
+	tx, rx *int32
+	net.Conn
+}
+
+func (c meteredConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if err == nil {
+		atomic.AddInt32(c.rx, int32(n))
+	}
+	return n, err
+}
+
+func (c meteredConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if err == nil {
+		atomic.AddInt32(c.tx, int32(n))
+	}
+	return n, err
+}
+
+type meteredDialer struct {
+	tx, rx int32
+	*net.Dialer
+}
+
+func (d *meteredDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	c, err := d.Dialer.DialContext(ctx, network, addr)
+	if err != nil {
+		return c, err
+	}
+	return meteredConn{&d.tx, &d.rx, c}, err
+}
+
+type Tester struct {
+	UserAgent   string
+	ThreadCount int
+}
+
+func NewTester(conf Config) *Tester {
+	return &Tester{
+		ThreadCount: conf.Server.ThreadCount,
+	}
+}
+
+func (c *Tester) dialer() *meteredDialer {
+	return &meteredDialer{
+		Dialer: &net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		},
+	}
+}
+
+func (c *Tester) httpClient(dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DisableCompression: true,
+			TLSNextProto:       make(map[string]func(string, *tls.Conn) http.RoundTripper),
+			DialContext:        dialContext,
+		},
+	}
+}
+
+func (t *Tester) newRequest(method, url string, contentLength int64, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+
+	if body != nil {
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.ContentLength = contentLength
+	}
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("User-Agent", t.UserAgent)
+	return req, nil
+}
+
+func (t *Tester) do(ctx context.Context, httpClient *http.Client, req *http.Request) error {
+	fmt.Println(req.Method, req.URL.String())
+
+	resp, err := httpClient.Do(req.WithContext(ctx))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("non-OK status code: %s", resp.Status)
+	}
+
+	_, err = io.Copy(ioutil.Discard, resp.Body)
+	return err
+}
+
 type Measurement struct {
 	Bytes, Seconds float64
 }
 
-type Tester struct {
-	Conf Conf
-}
-
-func (t Tester) downloadOne(ctx context.Context, url string) (m Measurement, err error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return
-	}
-	req = req.WithContext(ctx)
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("User-Agent", t.Conf.UserAgent)
-
-	start := time.Now()
-	resp, err := t.Conf.HTTPClient.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	elapsed := time.Since(start)
-
-	if resp.StatusCode != 200 {
-		err = fmt.Errorf("non-OK status code: %s", resp.Status)
-		return
-	}
-
-	bodyLen, err := io.Copy(ioutil.Discard, resp.Body)
-	return Measurement{float64(bodyLen), elapsed.Seconds()}, err
-}
-
-func (t Tester) downloadMany(ctx context.Context, urls ...string) (<-chan Measurement, <-chan error) {
+func (t Tester) Latency(ctx context.Context, srv Server, numTests uint) (<-chan Measurement, <-chan error) {
 	ch := make(chan Measurement)
 	errch := make(chan error, 1)
-	urlch := make(chan string)
 
-	go func() {
-		defer close(urlch)
-
-		for _, u := range urls {
-			select {
-			case <-ctx.Done():
-				return
-			case urlch <- u:
-			}
-		}
-	}()
+	latencyURL, err := (*url.URL)(srv.URL).Parse("./latency.txt")
+	if err != nil {
+		errch <- err
+		close(ch)
+		close(errch)
+		return ch, errch
+	}
 
 	go func() {
 		defer close(ch)
 		defer close(errch)
 
-		for u := range urlch {
-			m, err := t.downloadOne(ctx, u)
+		var wg sync.WaitGroup
+		for ; numTests > 0; numTests-- {
+			req, err := t.newRequest("GET", latencyURL.String(), 0, nil)
+			if err != nil {
+				errch <- err
+				return
+			}
+
+			var start time.Time
+			trace := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+				// XXX: will this only get called once? what about redirects?
+				GotFirstResponseByte: func() {
+					defer wg.Done()
+
+					select {
+					case <-ctx.Done():
+					case ch <- Measurement{
+						Seconds: time.Since(start).Seconds()}:
+					}
+				},
+			})
+
+			wg.Add(1)
+			start = time.Now()
+			err = t.do(trace, http.DefaultClient, req)
 			if err != nil {
 				errch <- err
 				return
@@ -160,127 +279,189 @@ func (t Tester) downloadMany(ctx context.Context, urls ...string) (<-chan Measur
 
 			select {
 			case <-ctx.Done():
+				errch <- ctx.Err()
 				return
-			case ch <- m:
+			default:
 			}
+		}
+
+		wg.Wait()
+	}()
+
+	return ch, errch
+}
+
+func (t Tester) Download(ctx context.Context, srv Server, sizes []uint) (<-chan Measurement, <-chan error) {
+	g, ctx := errgroup.WithContext(ctx)
+
+	srvURL := (*url.URL)(srv.URL)
+	dialer := t.dialer()
+	httpClient := t.httpClient(dialer.DialContext)
+
+	urlch := make(chan string)
+	g.Go(func() error {
+		defer close(urlch)
+
+		for _, size := range sizes {
+			downloadURL, err := srvURL.Parse(fmt.Sprintf("random%dx%d.jpg", size, size))
+			if err != nil {
+				return err
+			}
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case urlch <- downloadURL.String():
+			}
+		}
+		return nil
+	})
+
+	threads := t.ThreadCount
+	if threads < 1 {
+		threads = 1
+	}
+	for i := 0; i < threads; i++ {
+		g.Go(func() error {
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+
+				case u, valid := <-urlch:
+					if !valid {
+						return nil
+					}
+
+					req, err := t.newRequest("GET", u, 0, nil)
+					if err != nil {
+						return err
+					}
+
+					err = t.do(ctx, httpClient, req)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		})
+	}
+
+	ch := make(chan Measurement)
+	ticker := time.NewTicker(time.Second)
+	go func() {
+		defer ticker.Stop()
+		defer close(ch)
+
+		lastTick := time.Now()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				ch <- Measurement{
+					Bytes:   float64(atomic.SwapInt32(&dialer.rx, 0)),
+					Seconds: time.Since(lastTick).Seconds(),
+				}
+				lastTick = time.Now()
+			}
+		}
+	}()
+
+	errch := make(chan error, 1)
+	go func() {
+		defer close(errch)
+
+		err := g.Wait()
+		if err != nil {
+			errch <- err
 		}
 	}()
 
 	return ch, errch
 }
 
-func (t Tester) Latency(ctx context.Context, srv Server, numTests uint) (<-chan Measurement, <-chan error) {
-	dummych := make(chan Measurement)
-	errch := make(chan error, 1)
-	defer close(dummych)
-	defer close(errch)
+func (t Tester) Upload(ctx context.Context, srv Server, sizes []uint) (<-chan Measurement, <-chan error) {
+	g, ctx := errgroup.WithContext(ctx)
 
-	u, err := url.Parse(srv.URL)
-	if err != nil {
-		errch <- err
-		return dummych, errch
-	}
-
-	latencyURL, err := u.Parse("./latency.txt")
-	if err != nil {
-		errch <- err
-		return dummych, errch
-	}
-
-	var urls []string
-	for ; numTests > 0; numTests-- {
-		urls = append(urls, latencyURL.String())
-	}
-
-	return t.downloadMany(ctx, urls...)
-}
-
-func (t Tester) Download(ctx context.Context, srv Server, DLSizes []uint) (<-chan Measurement, <-chan error) {
-	dummych := make(chan Measurement)
-	errch := make(chan error, 1)
-	defer close(dummych)
-	defer close(errch)
-
-	u, err := url.Parse(srv.URL)
-	if err != nil {
-		errch <- err
-		return dummych, errch
-	}
-
-	var urls []string
-	for _, size := range DLSizes {
-		downloadURL, err := u.Parse(fmt.Sprintf("random%dx%d.jpg", size, size))
-		if err != nil {
-			errch <- err
-			return dummych, errch
-		}
-		urls = append(urls, downloadURL.String())
-	}
-
-	return t.downloadMany(ctx, urls...)
-}
-
-func (t Tester) uploadOne(ctx context.Context, url string, contentType string, contentLength int64, data io.Reader) (m Measurement, err error) {
-	req, err := http.NewRequest("POST", url, data)
-	if err != nil {
-		return
-	}
-	req = req.WithContext(ctx)
-	req.Header.Set("User-Agent", t.Conf.UserAgent)
-	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Content-Length", fmt.Sprintf("%d", contentLength))
-
-	start := time.Now()
-	resp, err := t.Conf.HTTPClient.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	elapsed := time.Since(start)
-
-	if resp.StatusCode != 200 {
-		err = fmt.Errorf("non-OK status code: %s", resp.Status)
-		return
-	}
-
-	_, err = io.Copy(ioutil.Discard, resp.Body)
-	return Measurement{float64(contentLength), elapsed.Seconds()}, nil
-}
-
-func (t Tester) Upload(ctx context.Context, srv Server, ULSizes []uint) (<-chan Measurement, <-chan error) {
-	ch := make(chan Measurement)
-	errch := make(chan error, 1)
-	sizech := make(chan int64)
 	rng := rand.New(rand.NewSource(1))
+	srvURL := (*url.URL)(srv.URL).String()
+	dialer := t.dialer()
+	httpClient := t.httpClient(dialer.DialContext)
 
-	go func() {
+	sizech := make(chan int64)
+	g.Go(func() error {
 		defer close(sizech)
 
-		for _, size := range ULSizes {
+		for _, size := range sizes {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case sizech <- int64(size):
+			}
+		}
+		return nil
+	})
+
+	threads := t.ThreadCount
+	if threads < 1 {
+		threads = 1
+	}
+	for i := 0; i < threads; i++ {
+		g.Go(func() error {
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+
+				case size, valid := <-sizech:
+					if !valid {
+						return nil
+					}
+
+					body := io.LimitReader(rng, size)
+					req, err := t.newRequest("POST", srvURL, size, body)
+					if err != nil {
+						return err
+					}
+
+					err = t.do(ctx, httpClient, req)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		})
+	}
+
+	ch := make(chan Measurement)
+	ticker := time.NewTicker(time.Second)
+	go func() {
+		defer ticker.Stop()
+		defer close(ch)
+
+		lastTick := time.Now()
+		for {
 			select {
 			case <-ctx.Done():
 				return
-			case sizech <- int64(size):
+			case <-ticker.C:
+				ch <- Measurement{
+					Bytes:   float64(atomic.SwapInt32(&dialer.tx, 0)),
+					Seconds: time.Since(lastTick).Seconds(),
+				}
+				lastTick = time.Now()
 			}
 		}
 	}()
 
+	errch := make(chan error, 1)
 	go func() {
-		defer close(ch)
 		defer close(errch)
 
-		for size := range sizech {
-			m, err := t.uploadOne(ctx, srv.URL, "application/octet-stream", size, io.LimitReader(rng, size))
-			if err != nil {
-				errch <- err
-				return
-			}
-
-			select {
-			case <-ctx.Done():
-				return
-			case ch <- m:
-			}
+		err := g.Wait()
+		if err != nil {
+			errch <- err
 		}
 	}()
 
@@ -290,29 +471,29 @@ func (t Tester) Upload(ctx context.Context, srv Server, ULSizes []uint) (<-chan 
 // ByDistance implements sort.Interface to allow sorting servers by distance
 type ByDistance []Server
 
-func (server ByDistance) Len() int {
-	return len(server)
+func (srv ByDistance) Len() int {
+	return len(srv)
 }
 
-func (server ByDistance) Less(i, j int) bool {
-	return server[i].Distance < server[j].Distance
+func (srv ByDistance) Less(i, j int) bool {
+	return srv[i].Distance < srv[j].Distance
 }
 
-func (server ByDistance) Swap(i, j int) {
-	server[i], server[j] = server[j], server[i]
+func (srv ByDistance) Swap(i, j int) {
+	srv[i], srv[j] = srv[j], srv[i]
 }
 
 // ByLatency implements sort.Interface to allow sorting servers by latency
 type ByLatency []Server
 
-func (server ByLatency) Len() int {
-	return len(server)
+func (srv ByLatency) Len() int {
+	return len(srv)
 }
 
-func (server ByLatency) Less(i, j int) bool {
-	return server[i].Latency < server[j].Latency
+func (srv ByLatency) Less(i, j int) bool {
+	return srv[i].Latency < srv[j].Latency
 }
 
-func (server ByLatency) Swap(i, j int) {
-	server[i], server[j] = server[j], server[i]
+func (srv ByLatency) Swap(i, j int) {
+	srv[i], srv[j] = srv[j], srv[i]
 }
