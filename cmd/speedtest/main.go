@@ -10,199 +10,256 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/rand"
+	"net/http"
 	"net/url"
 	"os"
-	"strings"
-	"time"
+	"sort"
 
-	"github.com/zpeters/speedtest/internal/print"
-	"github.com/zpeters/speedtest/internal/speedtests"
-	"github.com/zpeters/speedtest/internal/sthttp"
+	"github.com/zpeters/speedtest"
 
-	"github.com/dchest/uniuri"
-	"github.com/google/go-github/github"
-	"github.com/spf13/viper"
 	"github.com/urfave/cli"
 )
 
 // Version placeholder, injected in Makefile
 var Version string
 
-func runTest(c *cli.Context, stClient *sthttp.Client, tester *speedtests.Tester) {
-	// create our server object and load initial config
-	var testServer sthttp.Server
+func average(ch <-chan speedtest.Measurement) (avg speedtest.Measurement) {
+	var ticks float64
+	for m := range ch {
+		ticks++
+		avg.Bytes += m.Bytes
+		avg.Seconds += m.Seconds
+	}
 
-	config, err := stClient.GetConfig()
+	avg.Bytes /= ticks
+	avg.Seconds /= ticks
+	return
+}
+
+func bestLatency(ch <-chan speedtest.Measurement) (best speedtest.Measurement) {
+	for m := range ch {
+		if m.Seconds < best.Seconds || best.Seconds == 0 {
+			best = m
+		}
+	}
+	return
+}
+
+func bestBandwidth(ch <-chan speedtest.Measurement) (best speedtest.Measurement) {
+	var bestSpeed float64
+	for m := range ch {
+		var speed float64
+		if m.Seconds != 0 {
+			speed = m.Bytes / m.Seconds
+		}
+		if speed > bestSpeed || bestSpeed == 0 {
+			bestSpeed = speed
+			best = m
+		}
+	}
+	return
+}
+
+func listServers(app App) {
+	client := speedtest.NewClient(http.DefaultClient)
+	client.UserAgent = app.UserAgent
+
+	if app.Debug {
+		fmt.Println("Getting servers list...")
+	}
+
+	allServers, err := client.GetServers(app.ServersURL)
 	if err != nil {
-		log.Printf("Cannot get speedtest config\n")
 		log.Fatal(err)
 	}
-	stClient.Config = &config
 
-	// if we are *not* running a report then say hello to everyone
-	if !tester.Report {
-		fmt.Printf("github.com/zpeters/speedtest -- unofficial cli for speedtest.net\n")
+	if app.Debug {
+		fmt.Printf("(%d) found\n", len(allServers))
 	}
 
-	// if we are in debug mode print outa an environment report
-	if stClient.Debug {
-		print.EnvironmentReport(stClient)
+	for _, srv := range allServers {
+		fmt.Printf("%-6s | %s (%s, %s)\n", srv.ID, srv.Sponsor, srv.Name, srv.Country)
 	}
+}
+
+func runTest(c *cli.Context, app App) {
+	client := speedtest.NewClient(http.DefaultClient)
+	client.UserAgent = app.UserAgent
+
+	config, err := client.GetSpeedtestConfig(app.ConfigURL)
+	if err != nil {
+		log.Fatalln("Cannot get speedtest config:", err)
+	}
+	tester := speedtest.NewTester(config)
 
 	// get all possible servers (excluding blacklisted)
-	if stClient.Debug {
+	if app.Debug {
 		log.Printf("Getting all servers for our test list")
 	}
-	var allServers []sthttp.Server
+
+	var allServers []speedtest.Server
 	if c.String("mini") == "" {
-		allServers, err = stClient.GetServers()
+		allServers, err = client.GetServers(app.ServersURL)
 		if err != nil {
 			log.Fatal(err)
 		}
 	}
 
-	// if a mini speedtest installation was specified, use that...
 	if c.String("mini") != "" {
-
-		//construct testserver object manually
-		u, err := url.Parse(c.String("mini"))
-		if err != nil {
-			log.Fatalf("Speedtest mini server URL is not a valid URL: %s", err)
-		}
-
-		if stClient.Debug {
-			log.Printf("Using Mini Server '%s'", c.String("mini"))
-		}
-		testServer.URL = c.String("mini")
-		if !strings.HasSuffix(c.String("mini"), "/") {
-			testServer.URL += "/"
-		}
-		testServer.URL += "speedtest/upload.php"
-		testServer.Name = u.Host
-		testServer.Sponsor = "speedtest-mini"
-		testServer.ID = "0"
-
-		testServer.Latency, err = stClient.GetLatency(testServer, stClient.GetLatencyURL(testServer))
+		miniURL, err := url.Parse(c.String("mini"))
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		// if they specified a specific speedtest.net server, test against that...
+		miniUploadURL, err := miniURL.Parse("./speedtest/upload.php")
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		miniServer := speedtest.Server{
+			URL:     (*speedtest.UnmarshableURL)(miniUploadURL),
+			Name:    miniURL.Hostname(),
+			Sponsor: "speedtest-mini",
+			ID:      "0",
+		}
+		allServers = []speedtest.Server{miniServer}
+
 	} else if c.String("server") != "" {
-		if stClient.Debug {
-			log.Printf("Server '%s' specified, getting info...", c.String("server"))
+		var found []speedtest.Server
+		for _, srv := range allServers {
+			if srv.ID == c.String("server") {
+				found = append(found, srv)
+			}
 		}
-		// find server and load latency report
-		testServer = tester.FindServer(c.String("server"), allServers)
-		// load latency
-		testServer.Latency, err = stClient.GetLatency(testServer, stClient.GetLatencyURL(testServer))
-		if err != nil {
-			log.Fatal(err)
+		allServers = found
+
+		if len(allServers) != 1 {
+			log.Fatalln("Cannot find specified server ID", c.String("server"))
 		}
 
-		if !tester.Report {
-			fmt.Printf("Server: %s - %s (%s)\n", testServer.ID, testServer.Name, testServer.Sponsor)
-		}
-
-		// ...otherwise get a list of all servers sorted by distance...
 	} else {
-		if stClient.Debug {
-			log.Printf("Getting closest servers...")
+		speedtest.ComputeServersDistanceTo(allServers, config.Client.Latitude, config.Client.Longitude)
+		sort.Sort(speedtest.ByDistance(allServers))
+	}
+
+	for i := range allServers[:app.NumClosest] {
+		ch, errch := tester.Latency(context.Background(), allServers[i], app.NumLatencyTests)
+
+		if c.String("algo") == "max" {
+			allServers[i].Latency = bestLatency(ch).Seconds
+		} else {
+			allServers[i].Latency = average(ch).Seconds
 		}
-		closestServers := stClient.GetClosestServers(allServers)
-		if stClient.Debug {
-			log.Printf("Getting the fastests of our closest servers...")
-		}
-		// ... and get the fastests NUMCLOSEST ones
-		testServer = stClient.GetFastestServer(closestServers)
-		if !viper.GetBool("report") {
-			fmt.Printf("Server: %s - %s (%s)\n", testServer.ID, testServer.Name, testServer.Sponsor)
+
+		if err = <-errch; err != nil {
+			log.Fatal(err)
 		}
 	}
+	sort.Sort(speedtest.ByLatency(allServers[:app.NumClosest]))
+
+	testServer := allServers[0]
+	fmt.Printf("Server: %s - %s (%s)\n", testServer.ID, testServer.Name, testServer.Sponsor)
 
 	// if ping only then just output latency results and exit nicely...
 	if c.Bool("ping") {
-		if c.Bool("report") {
-			if viper.GetString("algotype") == "max" {
-				fmt.Printf("%3.2f (Lowest)\n", testServer.Latency)
-			} else {
-				fmt.Printf("%3.2f (Avg)\n", testServer.Latency)
-			}
+		if c.String("algo") == "max" {
+			fmt.Printf("Ping (Lowest): %3.2f ms\n", 1000*testServer.Latency)
 		} else {
-			if viper.GetString("algotype") == "max" {
-				fmt.Printf("Ping (Lowest): %3.2f ms\n", testServer.Latency)
-			} else {
-				fmt.Printf("Ping (Avg): %3.2f ms\n", testServer.Latency)
-			}
+			fmt.Printf("Ping (Avg): %3.2f ms\n", 1000*testServer.Latency)
 		}
-		os.Exit(0)
-		// ...otherwise run our full test
+
 	} else {
-		var dmbps float64
-		var umbps float64
+		var downspeed, upspeed float64
 
-		if !viper.GetBool("report") {
-			if c.Bool("downloadonly") {
-				dmbps = tester.Download(testServer)
-			} else if c.Bool("uploadonly") {
-				umbps = tester.Upload(testServer)
+		if c.Bool("downloadonly") || !c.Bool("uploadonly") {
+			ch, errch := tester.Download(context.TODO(), testServer, app.DLSizes)
+
+			ch2 := make(chan speedtest.Measurement)
+			go func() {
+				defer close(ch2)
+				for m := range ch {
+					fmt.Print(".")
+					ch2 <- m
+				}
+			}()
+
+			if c.String("algo") == "max" {
+				m := bestBandwidth(ch2)
+				downspeed = m.Bytes / m.Seconds
 			} else {
-				dmbps = tester.Download(testServer)
-				umbps = tester.Upload(testServer)
+				m := average(ch2)
+				downspeed = m.Bytes / m.Seconds
 			}
-			if viper.GetString("algotype") == "max" {
-				fmt.Printf("Ping (Lowest): %3.2f ms | Download (Max): %3.2f Mbps | Upload (Max): %3.2f Mbps\n", testServer.Latency, dmbps, umbps)
-			} else {
-				fmt.Printf("Ping (Avg): %3.2f ms | Download (Avg): %3.2f Mbps | Upload (Avg): %3.2f Mbps\n", testServer.Latency, dmbps, umbps)
-			}
 
-		} else {
-
-			fmt.Printf("%s%s%s%s\"%s (%s, %s)\"%s", time.Now().Format("2006-01-02 15:04:05 -0700"), viper.GetString("reportchar"), testServer.ID, viper.GetString("reportchar"), testServer.Sponsor, testServer.Name, testServer.Country, viper.GetString("reportchar"))
-			fmt.Printf("%3.2f%s", testServer.Latency, viper.GetString("reportchar"))
-
-			if c.Bool("downloadonly") {
-				dmbps = tester.Download(testServer)
-				dkbps := dmbps * 1000
-				fmt.Printf("%d\n", int(dkbps))
-			} else if c.Bool("uploadonly") {
-				umbps = tester.Upload(testServer)
-				ukbps := umbps * 1000
-				fmt.Printf("%d\n", int(ukbps))
-			} else {
-				dmbps = tester.Download(testServer)
-				dkbps := dmbps * 1000
-				fmt.Printf("%d%s", int(dkbps), viper.GetString("reportchar"))
-
-				umbps = tester.Upload(testServer)
-				ukbps := umbps * 1000
-				fmt.Printf("%d\n", int(ukbps))
+			if err = <-errch; err != nil {
+				log.Fatal(err)
 			}
 		}
+
+		if c.Bool("uploadonly") || !c.Bool("downloadonly") {
+			ch, errch := tester.Upload(context.TODO(), testServer, app.ULSizes)
+
+			ch2 := make(chan speedtest.Measurement)
+			go func() {
+				defer close(ch2)
+				for m := range ch {
+					fmt.Print(".")
+					ch2 <- m
+				}
+			}()
+
+			if c.String("algo") == "max" {
+				m := bestBandwidth(ch2)
+				upspeed = m.Bytes / m.Seconds
+			} else {
+				m := average(ch2)
+				upspeed = m.Bytes / m.Seconds
+			}
+
+			if err = <-errch; err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		var format string
+		if c.String("algo") == "max" {
+			format = "Ping (Lowest): %3.2f ms | Download (Max): %3.2f Mbps | Upload (Max): %3.2f Mbps\n"
+		} else {
+			format = "Ping (Avg): %3.2f ms | Download (Avg): %3.2f Mbps | Upload (Avg): %3.2f Mbps\n"
+		}
+
+		fmt.Println()
+		fmt.Printf(format, 1000*testServer.Latency, (8*downspeed)/1e6, (8*upspeed)/1e6)
 	}
 }
 
-func init() {
-	viper.SetDefault("debug", false)
-	viper.SetDefault("quiet", false)
-	viper.SetDefault("report", false)
-	viper.SetDefault("numclosest", 3)
-	viper.SetDefault("numlatencytests", 5)
-	viper.SetDefault("reportchar", "|")
-	viper.SetDefault("algotype", "max")
-	viper.SetDefault("httptimeout", 15)
-	viper.SetDefault("dlsizes", []int{350, 500, 750, 1000, 1500, 2000, 2500, 3000, 3500, 4000})
-	viper.SetDefault("ulsizes", []int{int(0.25 * 1024 * 1024), int(0.5 * 1024 * 1024), int(1.0 * 1024 * 1024), int(1.5 * 1024 * 1024), int(2.0 * 1024 * 1024)})
-	viper.SetDefault("speedtestconfigurl", "http://c.speedtest.net/speedtest-config.php?x="+uniuri.New())
-	viper.SetDefault("speedtestserversurl", "http://c.speedtest.net/speedtest-servers-static.php?x="+uniuri.New())
-	viper.SetDefault("useragent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.21 Safari/537.36")
+const (
+	defaultUserAgent       = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.21 Safari/537.36"
+	defaultNumClosest      = 5
+	defaultNumLatencyTests = 3
+)
+
+var (
+	defaultDLSizes = []uint{350, 500, 750, 1000, 1500, 2000, 2500, 3000, 3500, 4000}
+	defaultULSizes = []uint{0.25 * 1e6, 0.5 * 1e6, 1.0 * 1e6, 1.5 * 1e6, 2.0 * 1e6}
+)
+
+type App struct {
+	ConfigURL       string
+	ServersURL      string
+	AlgoType        string
+	NumClosest      uint
+	NumLatencyTests uint
+	Interface       string
+	Blacklist       []string
+	UserAgent       string
+	DLSizes         []uint
+	ULSizes         []uint
+	Debug           bool
+	Quiet           bool
 }
 
 func main() {
-	// seeding randomness
-	rand.Seed(time.Now().UTC().UnixNano())
-
 	// set logging to stdout for global logger
 	log.SetOutput(os.Stdout)
 
@@ -215,33 +272,25 @@ func main() {
 
 	// setup cli flags
 	app.Flags = []cli.Flag{
-		cli.StringFlag{
-			Name:  "algo, a",
-			Usage: "Specify the measurement method to use ('max', 'avg')",
-		},
 		cli.BoolFlag{
 			Name:  "debug, d",
 			Usage: "Turn on debugging",
-		},
-		cli.BoolFlag{
-			Name:  "list, l",
-			Usage: "List available servers",
-		},
-		cli.BoolFlag{
-			Name:  "update, u",
-			Usage: "Check for a new version of speedtest",
-		},
-		cli.BoolFlag{
-			Name:  "ping, p",
-			Usage: "Ping only mode",
 		},
 		cli.BoolFlag{
 			Name:  "quiet, q",
 			Usage: "Quiet mode",
 		},
 		cli.BoolFlag{
-			Name:  "report, r",
-			Usage: "Reporting mode output, minimal output with '|' for separators, use '--rc'\n\t\tto change separator characters. Reports the following: Server ID, \n\t\tServer Name (Location), Ping time in ms, Download speed in kbps, Upload speed in kbps",
+			Name:  "list, l",
+			Usage: "List available servers",
+		},
+		cli.StringFlag{
+			Name:  "algo, a",
+			Usage: "Specify the measurement method to use ('max', 'avg')",
+		},
+		cli.BoolFlag{
+			Name:  "ping, p",
+			Usage: "Ping only mode",
 		},
 		cli.BoolFlag{
 			Name:  "downloadonly, do",
@@ -250,10 +299,6 @@ func main() {
 		cli.BoolFlag{
 			Name:  "uploadonly, uo",
 			Usage: "Only perform upload test",
-		},
-		cli.StringFlag{
-			Name:  "reportchar, rc",
-			Usage: "Set the report separator. Example: --rc=','",
 		},
 		cli.StringFlag{
 			Name:  "server, s",
@@ -271,19 +316,14 @@ func main() {
 			Name:  "useragent, ua",
 			Usage: "Specify a useragent string",
 		},
-		cli.IntFlag{
+		cli.UintFlag{
 			Name:  "numclosest, nc",
-			Value: viper.GetInt("numclosest"),
+			Value: defaultNumClosest,
 			Usage: "Number of 'closest' servers to find",
 		},
-		cli.IntFlag{
-			Name:  "httptimeout, t",
-			Value: viper.GetInt("httptimeout"),
-			Usage: "Timeout (seconds) for http connections",
-		},
-		cli.IntFlag{
+		cli.UintFlag{
 			Name:  "numlatency, nl",
-			Value: viper.GetInt("numlatencytests"),
+			Value: defaultNumLatencyTests,
 			Usage: "Number of latency tests to perform",
 		},
 		cli.StringFlag{
@@ -294,88 +334,33 @@ func main() {
 
 	// toggle our switches and setup variables
 	app.Action = func(c *cli.Context) {
-		// just check the version if that is what they want
-		if c.Bool("update") {
-			// Check if there is an update
-			client := github.NewClient(nil)
-			ctx := context.Background()
-			latestRelease, _, err := client.Repositories.GetLatestRelease(ctx, "zpeters", "speedtest")
-			if err != nil {
-				log.Fatalf("github call: %s", err)
-			}
-			githubTag := *latestRelease.TagName
-			if Version != githubTag {
-				fmt.Printf("New version %s available at https://github.com/zpeters/speedtest/releases\n", githubTag)
-			} else {
-				fmt.Printf("You are up to date\n")
-			}
-			os.Exit(0)
-		}
-		// set our flags
-		if c.Bool("debug") {
-			viper.Set("debug", true)
-		}
-		if c.Bool("quiet") {
-			viper.Set("quiet", true)
-		}
-		if c.Bool("report") {
-			viper.Set("report", true)
-		}
-		if c.String("algo") != "" {
-			if c.String("algo") == "max" {
-				viper.Set("algotype", "max")
-			} else if c.String("algo") == "avg" {
-				viper.Set("algotype", "avg")
-			} else {
-				fmt.Printf("** Invalid algorithm '%s'\n", c.String("algo"))
-				os.Exit(1)
-			}
-		}
-		viper.Set("numclosest", c.Int("numclosest"))
-		viper.Set("numlatencytests", c.Int("numlatency"))
-		viper.Set("httptimeout", c.Int("httptimeout"))
-		if c.String("reportchar") != "" {
-			viper.Set("reportchar", c.String("reportchar"))
-		}
-		if c.String("interface") != "" {
-			viper.Set("interface", c.String("interface"))
-		}
-		if len(c.StringSlice("blacklist")) > 0 {
-			viper.Set("blacklist", c.StringSlice("blacklist"))
+		switch c.String("algo") {
+		case "", "max", "avg":
+		default:
+			fmt.Println("** Invalid algorithm:", c.String("algo"))
+			os.Exit(1)
 		}
 
-		stClient := sthttp.NewClient(
-			&sthttp.SpeedtestConfig{
-				ConfigURL:       viper.GetString("speedtestconfigurl"),
-				ServersURL:      viper.GetString("speedtestserversurl"),
-				AlgoType:        viper.GetString("algotype"),
-				NumClosest:      viper.GetInt("numclosest"),
-				NumLatencyTests: viper.GetInt("numlatencytests"),
-				Interface:       viper.GetString("interface"),
-				Blacklist:       viper.GetStringSlice("blacklist"),
-				UserAgent:       viper.GetString("useragent"),
-			},
-			&sthttp.HTTPConfig{
-				HTTPTimeout: viper.GetDuration("httptimeout") * time.Second,
-			},
-			viper.GetBool("debug"),
-			viper.GetString("reportchar"))
+		stClient := App{
+			ConfigURL:       speedtest.SpeedtestNetConfigURL,
+			ServersURL:      speedtest.SpeedtestNetServersURL,
+			AlgoType:        c.String("algotype"),
+			NumClosest:      c.Uint("numclosest"),
+			NumLatencyTests: c.Uint("numlatency"),
+			Interface:       c.String("interface"),
+			Blacklist:       c.StringSlice("blacklist"),
+			UserAgent:       defaultUserAgent,
+			DLSizes:         defaultDLSizes,
+			ULSizes:         defaultULSizes,
+			Debug:           c.Bool("debug"),
+			Quiet:           c.Bool("quiet"),
+		}
 
-		tester := speedtests.NewTester(
-			stClient,
-			viper.Get("dlsizes").([]int),
-			viper.Get("ulsizes").([]int),
-			viper.GetBool("quiet"),
-			viper.GetBool("report"))
-
-		// run a oneshot list
 		if c.Bool("list") {
-			tester.ListServers(stClient.SpeedtestConfig.ConfigURL, stClient.SpeedtestConfig.ServersURL, stClient.SpeedtestConfig.Blacklist)
-			os.Exit(0)
+			listServers(stClient)
+		} else {
+			runTest(c, stClient)
 		}
-
-		// run our test
-		runTest(c, stClient, tester)
 
 		// exit nicely
 		os.Exit(0)
