@@ -64,8 +64,11 @@ func (c Client) getResource(url string, xmlData interface{}) error {
 }
 
 type Config struct {
-	Client ConfigClient `xml:"client"`
-	Server ConfigServer `xml:"server-config"`
+	Client   ConfigClient `xml:"client"`
+	Server   ConfigServer `xml:"server-config"`
+	Latency  ConfigTest   `xml:"latency"`
+	Download ConfigTest   `xml:"download"`
+	Upload   ConfigTest   `xml:"upload"`
 }
 
 type ConfigClient struct {
@@ -79,6 +82,10 @@ type ConfigClient struct {
 type ConfigServer struct {
 	IgnoreIDs   string `xml:"ignoreids,attr"`
 	ThreadCount int    `xml:"threadcount,attr"`
+}
+
+type ConfigTest struct {
+	TestLengthSeconds float64 `xml:"testlength,attr"`
 }
 
 func (c Client) GetSpeedtestConfig(configURL string) (Config, error) {
@@ -98,18 +105,18 @@ func (u *UnmarshableURL) UnmarshalText(text []byte) error {
 }
 
 type Server struct {
-	URL      *UnmarshableURL `xml:"url,attr"`
-	URL2     *UnmarshableURL `xml:"url2,attr"`
-	Host     string          `xml:"host,attr"`
-	Lat      float64         `xml:"lat,attr"`
-	Lon      float64         `xml:"lon,attr"`
-	Name     string          `xml:"name,attr"`
-	Country  string          `xml:"country,attr"`
-	CC       string          `xml:"cc,attr"`
-	Sponsor  string          `xml:"sponsor,attr"`
-	ID       string          `xml:"id,attr"`
-	Distance float64         `xml:"-"`
-	Latency  float64         `xml:"-"`
+	URL         *UnmarshableURL `xml:"url,attr"`
+	URL2        *UnmarshableURL `xml:"url2,attr"`
+	Host        string          `xml:"host,attr"`
+	Latitude    float64         `xml:"lat,attr"`
+	Longitude   float64         `xml:"lon,attr"`
+	Name        string          `xml:"name,attr"`
+	Country     string          `xml:"country,attr"`
+	CountryCode string          `xml:"cc,attr"`
+	Sponsor     string          `xml:"sponsor,attr"`
+	ID          string          `xml:"id,attr"`
+	Distance    float64         `xml:"-"`
+	Latency     float64         `xml:"-"`
 }
 
 func (c Client) GetServers(serverListURL string) ([]Server, error) {
@@ -125,7 +132,7 @@ func (c Client) GetServers(serverListURL string) ([]Server, error) {
 func ComputeServersDistanceTo(servers []Server, lat, lon float64) error {
 	myPos := coords.DegPos(lat, lon)
 	for i, srv := range servers {
-		srvPos := coords.DegPos(srv.Lat, srv.Lon)
+		srvPos := coords.DegPos(srv.Latitude, srv.Longitude)
 		servers[i].Distance = coords.HsDist(myPos, srvPos)
 	}
 	return nil
@@ -384,7 +391,6 @@ func (t Tester) Download(ctx context.Context, srv Server, sizes []uint) (<-chan 
 func (t Tester) Upload(ctx context.Context, srv Server, sizes []uint) (<-chan Measurement, <-chan error) {
 	g, ctx := errgroup.WithContext(ctx)
 
-	rng := rand.New(rand.NewSource(1))
 	srvURL := (*url.URL)(srv.URL).String()
 	dialer := t.dialer()
 	httpClient := t.httpClient(dialer.DialContext)
@@ -409,6 +415,7 @@ func (t Tester) Upload(ctx context.Context, srv Server, sizes []uint) (<-chan Me
 	}
 	for i := 0; i < threads; i++ {
 		g.Go(func() error {
+			rng := rand.New(rand.NewSource(1))
 			for {
 				select {
 				case <-ctx.Done():
