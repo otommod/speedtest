@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -79,9 +80,16 @@ type ConfigClient struct {
 	Longitude float64 `xml:"lon,attr"`
 }
 
+type UnmarshableStringSlice []string
+
+func (ss *UnmarshableStringSlice) UnmarshalText(text []byte) error {
+	*ss = strings.Split(string(text), ",")
+	return nil
+}
+
 type ConfigServer struct {
-	IgnoreIDs   string `xml:"ignoreids,attr"`
-	ThreadCount int    `xml:"threadcount,attr"`
+	IgnoreIDs   UnmarshableStringSlice `xml:"ignoreids,attr"`
+	ThreadCount int                    `xml:"threadcount,attr"`
 }
 
 type ConfigTest struct {
@@ -355,10 +363,12 @@ func (t Tester) Download(ctx context.Context, srv Server, sizes []uint) (<-chan 
 	}
 
 	ch := make(chan Measurement)
-	ticker := time.NewTicker(time.Second)
 	go func() {
-		defer ticker.Stop()
 		defer close(ch)
+
+		// TODO: make the reporting interval configurable
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
 
 		lastTick := time.Now()
 		for {
@@ -377,12 +387,8 @@ func (t Tester) Download(ctx context.Context, srv Server, sizes []uint) (<-chan 
 
 	errch := make(chan error, 1)
 	go func() {
-		defer close(errch)
-
-		err := g.Wait()
-		if err != nil {
-			errch <- err
-		}
+		errch <- g.Wait()
+		close(errch)
 	}()
 
 	return ch, errch

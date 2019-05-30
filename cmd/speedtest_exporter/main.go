@@ -31,6 +31,9 @@ var (
 	// see also: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/User-Agent/Firefox
 	userAgent = fmt.Sprintf("Mozilla/5.0 (Windows NT %.1f; Win64; x64; rv:%.1f) Gecko/20100101 Firefox/%.1[2]f",
 		rand.Float32()*1e3+1, rand.Float32()*1e3+1)
+
+	defaultDLSizes = []uint{350, 500, 750, 1000, 1500, 2000, 2500, 3000, 3500, 4000}
+	defaultULSizes = []uint{0.25 * 1e6, 0.5 * 1e6, 1.0 * 1e6, 1.5 * 1e6, 2.0 * 1e6}
 )
 
 var (
@@ -140,16 +143,39 @@ func (t *testRunner) probe(ctx context.Context, registry *prometheus.Registry, s
 
 	var testServer speedtest.Server
 	{
-		timeout := 20 * time.Second
+		timeout := 30 * time.Second
 		if config.Latency.TestLengthSeconds != 0 {
-			timeout = time.Duration(config.Latency.TestLengthSeconds) * time.Second
+			timeout = time.Duration(config.Latency.TestLengthSeconds * float64(time.Second))
 		}
-		ctx, cancel := context.WithTimeout(ctx, timeout)
+		testLengthCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
 		const numFastestServers = 5
-		for i, srv := range servers[:numFastestServers] {
-			ch, errch := tester.Latency(ctx, srv, 3)
+		for i := range servers[:numFastestServers] {
+			srv := &servers[i]
+			ch, errch := tester.Latency(testLengthCtx, *srv, 3)
+
+
+	loop3:
+		for {
+			select {
+			case <-testLengthCtx.Done():
+				break loop
+			case m, ok := <-ch:
+				if !ok {
+					if err := <-errch; err != nil && err != context.DeadlineExceeded {
+						level.Error(t.logger).Log("msg", "Error testing download speed", "err", err)
+				level.Error(t.logger).Log("msg", "Error testing latency for server", "server", fmt.Sprintf("%s - %s (%s)", srv.ID, srv.Name, srv.Sponsor), "err", err)
+				continue
+						return false
+					}
+				}
+				ticks++
+				downspeed += m.Bytes / m.Seconds
+			}
+		}
+		downspeed /= ticks
+	}
 
 			for m := range ch {
 				if srv.Latency < m.Seconds || srv.Latency == 0 {
@@ -161,7 +187,6 @@ func (t *testRunner) probe(ctx context.Context, registry *prometheus.Registry, s
 				level.Error(t.logger).Log("msg", "Error testing latency for server", "server", fmt.Sprintf("%s - %s (%s)", srv.ID, srv.Name, srv.Sponsor), "err", err)
 				continue
 			}
-			servers[i] = srv
 		}
 
 		sort.Sort(speedtest.ByLatency(servers[:numFastestServers]))
@@ -177,55 +202,66 @@ func (t *testRunner) probe(ctx context.Context, registry *prometheus.Registry, s
 	level.Info(t.logger).Log("msg", "Testing against server", "name", testServer.Name, "sponsor", testServer.Sponsor, "latency_seconds", testServer.Latency)
 	latency.Set(testServer.Latency)
 
-	defaultDLSizes := []uint{350, 500, 750, 1000, 1500, 2000, 2500, 3000, 3500, 4000}
-	defaultULSizes := []uint{0.25 * 1e6, 0.5 * 1e6, 1.0 * 1e6, 1.5 * 1e6, 2.0 * 1e6}
-
 	var downspeed float64
 	{
-		timeout := 50 * time.Second
+		timeout := time.Minute
 		if config.Download.TestLengthSeconds != 0 {
-			timeout = time.Duration(config.Download.TestLengthSeconds) * time.Second
+			timeout = time.Duration(config.Download.TestLengthSeconds * float64(time.Second))
 		}
-		ctx, cancel := context.WithTimeout(ctx, timeout)
+		testLengthCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		ch, errch := tester.Download(ctx, testServer, defaultDLSizes)
+		ch, errch := tester.Download(testLengthCtx, testServer, defaultDLSizes)
 
 		var ticks float64
-		for m := range ch {
-			ticks++
-			downspeed += m.Bytes / m.Seconds
+	loop:
+		for {
+			select {
+			case <-testLengthCtx.Done():
+				break loop
+			case m, ok := <-ch:
+				if !ok {
+					if err := <-errch; err != nil && err != context.DeadlineExceeded {
+						level.Error(t.logger).Log("msg", "Error testing download speed", "err", err)
+						return false
+					}
+				}
+				ticks++
+				downspeed += m.Bytes / m.Seconds
+			}
 		}
 		downspeed /= ticks
-
-		if err := <-errch; err != nil && err != context.DeadlineExceeded {
-			level.Error(t.logger).Log("msg", "Error testing download speed", "err", err)
-			return false
-		}
 	}
 
 	var upspeed float64
 	{
-		timeout := 50 * time.Second
+		timeout := time.Minute
 		if config.Upload.TestLengthSeconds != 0 {
-			timeout = time.Duration(config.Upload.TestLengthSeconds) * time.Second
+			timeout = time.Duration(config.Upload.TestLengthSeconds * float64(time.Second))
 		}
-		ctx, cancel := context.WithTimeout(ctx, timeout)
+		testLengthCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		ch, errch := tester.Upload(ctx, testServer, defaultULSizes)
+		ch, errch := tester.Upload(testLengthCtx, testServer, defaultULSizes)
 
 		var ticks float64
-		for m := range ch {
-			ticks++
-			upspeed += m.Bytes / m.Seconds
+	loop2:
+		for {
+			select {
+			case <-testLengthCtx.Done():
+				break loop2
+			case m, ok := <-ch:
+				if !ok {
+					if err := <-errch; err != nil && err != context.DeadlineExceeded {
+						level.Error(t.logger).Log("msg", "Error testing upload speed", "err", err)
+						return false
+					}
+				}
+				ticks++
+				upspeed += m.Bytes / m.Seconds
+			}
 		}
 		upspeed /= ticks
-
-		if err := <-errch; err != nil && err != context.DeadlineExceeded {
-			level.Error(t.logger).Log("msg", "Error testing upload speed", "err", err)
-			return false
-		}
 	}
 
 	download.Set(downspeed)
